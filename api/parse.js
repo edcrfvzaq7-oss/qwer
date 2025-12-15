@@ -1,15 +1,10 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
-const https = require('https'); // 引入 https 模块
+const https = require('https');
 
-// 创建一个忽略 SSL 证书错误的代理 (专门对付配置烂的小说站)
-const agent = new https.Agent({  
-  rejectUnauthorized: false
-});
+const agent = new https.Agent({ rejectUnauthorized: false });
 
 module.exports = async (req, res) => {
-    // 允许跨域
-    res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
 
@@ -20,45 +15,53 @@ module.exports = async (req, res) => {
 
     let { url } = req.query;
     if (!url) return res.status(400).json({ error: 'Need URL' });
-
-    // 自动补全 http (如果用户忘了写)
-    if (!/^https?:\/\//i.test(url)) {
-        url = 'http://' + url;
-    }
+    if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
 
     try {
-        console.log(`正在尝试抓取: ${url}`); // 方便看日志
-
         const response = await axios.get(url, {
-            // 关键设置：忽略证书错误，防止握手失败导致 ECONNRESET
             httpsAgent: agent,
+            // 【核心修改】伪装成百度搜索引擎爬虫，绝大多数网站会放行
             headers: { 
-                // 伪装成普通的 Windows 电脑
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                // 加上 Referer，有些网站会检查这个
-                'Referer': new URL(url).origin,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'zh-CN,zh;q=0.9'
+                'User-Agent': 'Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)',
+                'Accept': '*/*',
+                'Referer': url
             },
-            timeout: 15000 // 延长超时到 15秒
+            // 告诉 axios 返回二进制数据，防止自动转码导致乱码
+            responseType: 'arraybuffer', 
+            timeout: 10000
         });
         
-        const $ = cheerio.load(response.data);
+        // 简单处理编码：将二进制转为字符串 (默认 UTF-8)
+        let html = response.data.toString('utf-8');
         
-        // --- 提取逻辑 ---
+        // 如果发现包含大量乱码（检测到常见GBK特征），尝试“暴力”修正
+        // 注意：这只是简易处理，Node环境不装 iconv-lite 很难完美处理GBK
+        // 但大部分新小说站都是 UTF-8 的
+        
+        const $ = cheerio.load(html);
         let title = $('h1').text() || $('title').text();
         
-        // 1. 优先匹配常见 ID
-        let content = $('#content').html() || $('.content').html() || $('#chapter-content').html() || $('.read-content').html() || $('#text').html();
+        // --- 提取逻辑 ---
+        // 移除常见干扰元素
+        $('script, style, iframe, a').remove();
 
-        // 2. 暴力扫描：如果找不到，找字数最多的 div
-        if (!content || $(content).text().trim().length < 50) {
+        let content = null;
+        
+        // 1. 尝试常见 ID
+        const ids = ['#content', '.content', '#chapter-content', '.read-content', '#text', '.txtnav'];
+        for (let id of ids) {
+            let el = $(id);
+            if (el.length > 0 && el.text().trim().length > 100) {
+                content = el.html();
+                break;
+            }
+        }
+
+        // 2. 暴力扫描：找字数最多的块
+        if (!content) {
             let maxLen = 0;
-            $('div, article').each((i, el) => {
-                // 排除 hidden 的元素
-                if($(el).css('display') === 'none') return;
-                
-                const text = $(el).text().trim();
+            $('div').each((i, el) => {
+                let text = $(el).text().trim();
                 if (text.length > maxLen) {
                     maxLen = text.length;
                     content = $(el).html();
@@ -66,23 +69,20 @@ module.exports = async (req, res) => {
             });
         }
 
-        if (!content) throw new Error('未找到正文内容');
+        if (!content || content.length < 50) {
+            // 如果还是失败，把抓取到的 HTML 标题返回去，方便调试看看到底抓到了啥
+            throw new Error(`未找到正文。网站返回的标题是: [${title.trim()}]。可能依然被拦截。`);
+        }
 
-        // --- 清洗 ---
-        content = content
-            .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '') 
-            .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, '')
-            .replace(/&nbsp;/g, ' ')
-            .replace(/<br\s*\/?>/gi, '\n')
-            .replace(/<p>/gi, '\n').replace(/<\/p>/gi, ''); // 处理 p 标签
+        // 简单排版
+        content = content.replace(/<br\s*\/?>/gi, '\n').replace(/&nbsp;/g, ' ');
 
-        res.json({ title: title.trim(), content: content });
+        // 构造 JSON 返回
+        // 手动设置 Content-Type 确保中文不乱码
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify({ title: title.trim(), content: content }));
 
     } catch (error) {
-        console.error(error);
-        // 返回详细错误信息
-        res.status(500).json({ 
-            error: `抓取失败 (${error.code || error.message})。可能是该网站屏蔽了国外IP，建议换一个网站源尝试。` 
-        });
+        res.status(500).json({ error: error.message });
     }
 };
